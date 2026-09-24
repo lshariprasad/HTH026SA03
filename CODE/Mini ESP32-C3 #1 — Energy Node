@@ -1,0 +1,574 @@
+/*
+  ============================================================
+  SMART ADAPTIVE STREET LIGHTING
+  HTH-SA-06
+
+  MINI ESP32-C3 #1
+  ENERGY NODE
+
+  FUNCTIONS
+  ------------------------------------------------------------
+  1. Read voltage
+  2. Read current
+  3. Calculate power
+  4. Calculate accumulated energy
+  5. Estimate battery percentage
+  6. Send data to MAIN ESP32 using UDP over Wi-Fi
+  7. Serial monitoring for calibration
+
+  COMMUNICATION
+  ------------------------------------------------------------
+  Wi-Fi:
+      SSID     = ls_hariprasad
+      PASSWORD = HARIDEVAN@1410
+
+  UDP:
+      Port = 4210
+
+  PACKET SENT TO MAIN ESP32:
+      ENERGY,Voltage,Current,Power,Energy,Battery,RSSI
+
+  Example:
+      ENERGY,3.870,0.120,0.464,0.003421,82.0,-48
+
+  ------------------------------------------------------------
+  ESP32-C3 PINS
+  ------------------------------------------------------------
+  Current Sensor OUT -> GPIO 3
+  Voltage Sensor OUT -> GPIO 4
+
+  IMPORTANT
+  ------------------------------------------------------------
+  The calibration values below depend on your exact sensor
+  modules. They MUST be calibrated before using the readings
+  as real measurements.
+*/
+
+// ============================================================
+// LIBRARIES
+// ============================================================
+
+#include <WiFi.h>
+#include <WiFiUdp.h>
+
+// ============================================================
+// WIFI
+// ============================================================
+
+const char* WIFI_SSID     = "ls_hariprasad";
+const char* WIFI_PASSWORD = "HARIDEVAN@1410";
+
+// ============================================================
+// ESP32-C3 ADC PINS
+// ============================================================
+
+#define CURRENT_SENSOR_PIN 3
+#define VOLTAGE_SENSOR_PIN 4
+
+// ============================================================
+// UDP CONFIGURATION
+// ============================================================
+
+WiFiUDP udp;
+
+const uint16_t UDP_PORT = 4210;
+
+// Broadcast packet so the Main ESP32 can receive it
+IPAddress broadcastIP(255, 255, 255, 255);
+
+// ============================================================
+// ADC CONFIGURATION
+// ============================================================
+
+const int ADC_RESOLUTION = 12;
+
+// ============================================================
+// VOLTAGE SENSOR CALIBRATION
+// ============================================================
+//
+// Example:
+// A common voltage-divider module may have approximately
+// a 5:1 ratio.
+//
+// THIS IS ONLY AN EXAMPLE.
+//
+// You must calibrate this value with a multimeter.
+//
+// Example:
+// ADC sees 0.80 V
+// Actual battery = 4.00 V
+//
+// Ratio = 4.00 / 0.80 = 5.0
+// ============================================================
+
+float VOLTAGE_SENSOR_RATIO = 5.00;
+
+// Small correction factor.
+// Keep 1.00 initially.
+float VOLTAGE_CALIBRATION_FACTOR = 1.00;
+
+// ============================================================
+// CURRENT SENSOR CALIBRATION
+// ============================================================
+//
+// These values are examples for an analog current sensor.
+//
+// CURRENT_ZERO_VOLTAGE:
+// Sensor voltage when current = 0 A
+//
+// CURRENT_SENSITIVITY:
+// Voltage change per ampere.
+//
+// Example:
+// 0.100 V/A = 100 mV per amp.
+//
+// THESE VALUES DEPEND ON YOUR SENSOR.
+// ============================================================
+
+float CURRENT_ZERO_VOLTAGE = 1.650;
+float CURRENT_SENSITIVITY   = 0.100;
+
+// Current calibration multiplier
+float CURRENT_CALIBRATION_FACTOR = 1.00;
+
+// ============================================================
+// BATTERY CALIBRATION
+// ============================================================
+//
+// Approximate single-cell Li-ion voltage range.
+//
+// This is only a voltage-based estimate, NOT a fuel gauge.
+// For a more accurate system we can later add a dedicated
+// battery fuel-gauge IC.
+// ============================================================
+
+const float BATTERY_EMPTY = 3.20;
+const float BATTERY_FULL  = 4.20;
+
+// ============================================================
+// MEASUREMENT VARIABLES
+// ============================================================
+
+float batteryVoltage = 0.0;
+float currentAmps    = 0.0;
+float powerWatts     = 0.0;
+float energyWh       = 0.0;
+float batteryPercent = 0.0;
+
+// ============================================================
+// TIMERS
+// ============================================================
+
+unsigned long lastMeasurementTime = 0;
+unsigned long lastSendTime        = 0;
+unsigned long lastSerialTime      = 0;
+unsigned long lastWiFiCheck       = 0;
+
+// ============================================================
+// READ ADC IN MILLIVOLTS
+// ============================================================
+
+float readADCVoltage(uint8_t pin)
+{
+  const int samples = 30;
+
+  uint32_t totalMilliVolts = 0;
+
+  for (int i = 0; i < samples; i++)
+  {
+    totalMilliVolts += analogReadMilliVolts(pin);
+
+    delayMicroseconds(500);
+  }
+
+  float averageMilliVolts =
+      (float)totalMilliVolts / samples;
+
+  return averageMilliVolts / 1000.0;
+}
+
+// ============================================================
+// READ BATTERY / INPUT VOLTAGE
+// ============================================================
+
+float readBatteryVoltage()
+{
+  float sensorVoltage =
+      readADCVoltage(VOLTAGE_SENSOR_PIN);
+
+  float actualVoltage =
+      sensorVoltage *
+      VOLTAGE_SENSOR_RATIO *
+      VOLTAGE_CALIBRATION_FACTOR;
+
+  return actualVoltage;
+}
+
+// ============================================================
+// READ CURRENT
+// ============================================================
+
+float readCurrent()
+{
+  float sensorVoltage =
+      readADCVoltage(CURRENT_SENSOR_PIN);
+
+  float current =
+      (sensorVoltage - CURRENT_ZERO_VOLTAGE)
+      / CURRENT_SENSITIVITY;
+
+  current *= CURRENT_CALIBRATION_FACTOR;
+
+  // Remove small sensor/ADC noise
+  if (fabs(current) < 0.02)
+  {
+    current = 0.0;
+  }
+
+  return fabs(current);
+}
+
+// ============================================================
+// BATTERY PERCENTAGE
+// ============================================================
+
+float calculateBatteryPercent(float voltage)
+{
+  float percentage =
+      ((voltage - BATTERY_EMPTY) /
+       (BATTERY_FULL - BATTERY_EMPTY)) * 100.0;
+
+  if (percentage < 0.0)
+  {
+    percentage = 0.0;
+  }
+
+  if (percentage > 100.0)
+  {
+    percentage = 100.0;
+  }
+
+  return percentage;
+}
+
+// ============================================================
+// SEND ENERGY DATA
+// ============================================================
+
+void sendEnergyData()
+{
+  char packet[180];
+
+  snprintf(
+    packet,
+    sizeof(packet),
+
+    "ENERGY,%.3f,%.3f,%.3f,%.6f,%.1f,%d",
+
+    batteryVoltage,
+    currentAmps,
+    powerWatts,
+    energyWh,
+    batteryPercent,
+    WiFi.RSSI()
+  );
+
+  udp.beginPacket(
+    broadcastIP,
+    UDP_PORT
+  );
+
+  udp.print(packet);
+
+  udp.endPacket();
+
+  Serial.println();
+  Serial.println("--------------------------------");
+  Serial.println("ENERGY DATA SENT");
+  Serial.println(packet);
+  Serial.println("--------------------------------");
+}
+
+// ============================================================
+// WIFI CONNECTION
+// ============================================================
+
+void connectWiFi()
+{
+  Serial.println();
+  Serial.println("Connecting to Wi-Fi...");
+
+  WiFi.mode(WIFI_STA);
+
+  WiFi.begin(
+    WIFI_SSID,
+    WIFI_PASSWORD
+  );
+
+  unsigned long startAttempt =
+      millis();
+
+  while (
+    WiFi.status() != WL_CONNECTED &&
+    millis() - startAttempt < 20000
+  )
+  {
+    delay(500);
+
+    Serial.print(".");
+  }
+
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    Serial.println("Wi-Fi CONNECTED");
+
+    Serial.print("Energy Node IP: ");
+    Serial.println(WiFi.localIP());
+
+    Serial.print("Gateway: ");
+    Serial.println(WiFi.gatewayIP());
+
+    Serial.print("RSSI: ");
+    Serial.print(WiFi.RSSI());
+    Serial.println(" dBm");
+  }
+  else
+  {
+    Serial.println("Wi-Fi connection FAILED");
+  }
+}
+
+// ============================================================
+// WIFI MONITOR
+// ============================================================
+
+void checkWiFi()
+{
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.println();
+    Serial.println("Wi-Fi disconnected.");
+    Serial.println("Trying to reconnect...");
+
+    WiFi.disconnect();
+
+    WiFi.begin(
+      WIFI_SSID,
+      WIFI_PASSWORD
+    );
+
+    return;
+  }
+}
+
+// ============================================================
+// SERIAL DISPLAY
+// ============================================================
+
+void printEnergyData()
+{
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("       ENERGY NODE DATA");
+  Serial.println("================================");
+
+  Serial.print("Battery Voltage : ");
+  Serial.print(batteryVoltage, 3);
+  Serial.println(" V");
+
+  Serial.print("Current         : ");
+  Serial.print(currentAmps, 3);
+  Serial.println(" A");
+
+  Serial.print("Power           : ");
+  Serial.print(powerWatts, 3);
+  Serial.println(" W");
+
+  Serial.print("Energy          : ");
+  Serial.print(energyWh, 6);
+  Serial.println(" Wh");
+
+  Serial.print("Battery         : ");
+  Serial.print(batteryPercent, 1);
+  Serial.println(" %");
+
+  Serial.print("Wi-Fi RSSI      : ");
+  Serial.print(WiFi.RSSI());
+  Serial.println(" dBm");
+
+  Serial.println("================================");
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup()
+{
+  Serial.begin(115200);
+
+  delay(1000);
+
+  Serial.println();
+  Serial.println();
+  Serial.println("============================================");
+  Serial.println("   SMART ADAPTIVE STREET LIGHTING");
+  Serial.println("   MINI ESP32-C3 #1 ENERGY NODE");
+  Serial.println("============================================");
+
+  // ----------------------------------------------------------
+  // ADC
+  // ----------------------------------------------------------
+
+  analogReadResolution(ADC_RESOLUTION);
+
+  // ESP32-C3 ADC attenuation
+  analogSetPinAttenuation(
+    CURRENT_SENSOR_PIN,
+    ADC_11db
+  );
+
+  analogSetPinAttenuation(
+    VOLTAGE_SENSOR_PIN,
+    ADC_11db
+  );
+
+  // ----------------------------------------------------------
+  // Wi-Fi
+  // ----------------------------------------------------------
+
+  connectWiFi();
+
+  // ----------------------------------------------------------
+  // UDP
+  // ----------------------------------------------------------
+
+  udp.begin(UDP_PORT);
+
+  Serial.print("UDP Port: ");
+  Serial.println(UDP_PORT);
+
+  // ----------------------------------------------------------
+  // Timers
+  // ----------------------------------------------------------
+
+  lastMeasurementTime = millis();
+  lastSendTime        = millis();
+  lastSerialTime      = millis();
+  lastWiFiCheck       = millis();
+
+  Serial.println();
+  Serial.println("ENERGY NODE READY.");
+  Serial.println();
+}
+
+// ============================================================
+// LOOP
+// ============================================================
+
+void loop()
+{
+  unsigned long now =
+      millis();
+
+  // ==========================================================
+  // MEASURE EVERY 500 ms
+  // ==========================================================
+
+  if (
+    now - lastMeasurementTime >= 500
+  )
+  {
+    float elapsedSeconds =
+        (now - lastMeasurementTime) /
+        1000.0;
+
+    lastMeasurementTime = now;
+
+    // --------------------------------------------------------
+    // READ SENSORS
+    // --------------------------------------------------------
+
+    batteryVoltage =
+        readBatteryVoltage();
+
+    currentAmps =
+        readCurrent();
+
+    // --------------------------------------------------------
+    // POWER
+    // --------------------------------------------------------
+
+    powerWatts =
+        batteryVoltage *
+        currentAmps;
+
+    // --------------------------------------------------------
+    // ENERGY
+    //
+    // Wh = W × hours
+    // --------------------------------------------------------
+
+    energyWh +=
+        powerWatts *
+        (elapsedSeconds / 3600.0);
+
+    // --------------------------------------------------------
+    // BATTERY %
+    // --------------------------------------------------------
+
+    batteryPercent =
+        calculateBatteryPercent(
+          batteryVoltage
+        );
+  }
+
+  // ==========================================================
+  // SEND TO MAIN ESP32 EVERY 1 SECOND
+  // ==========================================================
+
+  if (
+    now - lastSendTime >= 1000
+  )
+  {
+    lastSendTime = now;
+
+    if (
+      WiFi.status() ==
+      WL_CONNECTED
+    )
+    {
+      sendEnergyData();
+    }
+  }
+
+  // ==========================================================
+  // SERIAL MONITOR EVERY 2 SECONDS
+  // ==========================================================
+
+  if (
+    now - lastSerialTime >= 2000
+  )
+  {
+    lastSerialTime = now;
+
+    printEnergyData();
+  }
+
+  // ==========================================================
+  // CHECK WIFI EVERY 5 SECONDS
+  // ==========================================================
+
+  if (
+    now - lastWiFiCheck >= 5000
+  )
+  {
+    lastWiFiCheck = now;
+
+    checkWiFi();
+  }
+
+  delay(5);
+}
