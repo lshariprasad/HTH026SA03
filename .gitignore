@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ML models / generated files
+*.pkl
+*.joblib
+*.h5
+*.keras
+
+# Secrets
+.env
+.env.*
+secrets/
+credentials/
+*.key
+*.pem
+
+# Blynk / API secrets
+*credentials*
+*secrets*
+
+# Arduino
+*.bin
+*.elf
+*.hex
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Temporary files
+*.tmp
+*.log
