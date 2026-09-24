@@ -1,0 +1,1658 @@
+/*
+  ============================================================
+  SMART ADAPTIVE STREET LIGHTING
+  HTH-SA-06
+
+  MINI ESP32-C3 #2
+  INTELLIGENT LIGHTING NODE
+
+  ============================================================
+  FEATURES
+  ============================================================
+
+  1. LDR ambient-light sensing
+  2. PIR motion detection
+  3. Ultrasonic distance detection
+  4. Vibration detection
+  5. Potentiometer idle-brightness adjustment
+  6. Optional brightness adjustment button
+  7. PWM LED brightness control
+  8. Fast motion-triggered ramp to 100%
+  9. Safety response latency measurement
+  10. OLED local monitoring
+  11. Wi-Fi communication
+  12. UDP communication with MAIN ESP32
+  13. AUTO / MANUAL mode
+  14. Remote manual brightness command
+  15. Estimated energy-saving calculation
+
+  ============================================================
+  WIFI
+  ============================================================
+
+  SSID:
+      ls_hariprasad
+
+  PASSWORD:
+      HARIDEVAN@1410
+
+  ============================================================
+  UDP
+  ============================================================
+
+  Port:
+      4210
+
+  ============================================================
+  OUTPUT PACKET TO MAIN ESP32
+  ============================================================
+
+  LIGHT,Ambient,Motion,Distance,Brightness,
+  Vibration,Latency,Saving,RSSI
+
+  Example:
+
+  LIGHT,18,1,320.5,100,0,125,64.2,-52
+
+  ============================================================
+  INPUT CONTROL PACKET FROM MAIN ESP32
+  ============================================================
+
+  AUTO:
+      CONTROL,AUTO,0
+
+  MANUAL:
+      CONTROL,MANUAL,50
+
+  ============================================================
+  ESP32-C3 PIN MAP
+  ============================================================
+
+  LDR                  GPIO 0
+  POTENTIOMETER        GPIO 1
+  LED PWM              GPIO 3
+  VIBRATION             GPIO 4
+  PIR                   GPIO 5
+  ULTRASONIC TRIG      GPIO 6
+  ULTRASONIC ECHO      GPIO 7
+  OLED SDA             GPIO 8
+  OLED SCL             GPIO 9
+  ADJUST BUTTON        GPIO 10
+
+  ============================================================
+*/
+
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <Wire.h>
+
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ============================================================
+// WIFI
+// ============================================================
+
+const char* WIFI_SSID =
+  "ls_hariprasad";
+
+const char* WIFI_PASSWORD =
+  "HARIDEVAN@1410";
+
+// ============================================================
+// PINS
+// ============================================================
+
+#define LDR_PIN       0
+#define POT_PIN       1
+#define LED_PIN       3
+#define VIBRATION_PIN 4
+#define PIR_PIN       5
+
+#define ULTRASONIC_TRIG 6
+#define ULTRASONIC_ECHO 7
+
+#define OLED_SDA 8
+#define OLED_SCL 9
+
+#define ADJUST_BUTTON 10
+
+// ============================================================
+// OLED
+// ============================================================
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+
+#define OLED_RESET -1
+
+Adafruit_SSD1306 display(
+  SCREEN_WIDTH,
+  SCREEN_HEIGHT,
+  &Wire,
+  OLED_RESET
+);
+
+// ============================================================
+// UDP
+// ============================================================
+
+WiFiUDP udp;
+
+const uint16_t UDP_PORT = 4210;
+
+IPAddress broadcastIP(
+  255,
+  255,
+  255,
+  255
+);
+
+// ============================================================
+// PWM
+// ============================================================
+
+/*
+  ESP32-C3 Arduino core versions can use the current
+  LEDC API.
+
+  If your installed Arduino-ESP32 core does not accept
+  ledcAttach(), update the ESP32 board package.
+*/
+
+const int PWM_FREQUENCY = 5000;
+const int PWM_RESOLUTION = 8;
+
+// ============================================================
+// LIGHTING PARAMETERS
+// ============================================================
+
+// Minimum idle brightness
+int idleBrightness = 20;
+
+// Maximum lighting
+const int FULL_BRIGHTNESS = 100;
+
+// Manual brightness
+int manualBrightness = 50;
+
+// Current brightness
+int currentBrightness = 0;
+
+// Target brightness
+int targetBrightness = 0;
+
+// ============================================================
+// LDR PARAMETERS
+// ============================================================
+
+// ADC range
+const int ADC_MAX = 4095;
+
+// Dark threshold.
+// This value MUST be calibrated for your LDR circuit.
+int DARK_THRESHOLD = 1800;
+
+// ============================================================
+// ULTRASONIC
+// ============================================================
+
+float distanceCM = 999.0;
+
+// ============================================================
+// SENSOR STATES
+// ============================================================
+
+float ambientLightPercent = 0.0;
+
+bool motionDetected = false;
+
+bool vibrationDetected = false;
+
+bool nightMode = false;
+
+// ============================================================
+// AUTO / MANUAL
+// ============================================================
+
+bool manualMode = false;
+
+// ============================================================
+// SAFETY LATENCY
+// ============================================================
+
+unsigned long motionStartTime = 0;
+
+bool measuringLatency = false;
+
+int safetyLatency = 0;
+
+// ============================================================
+// MOTION TIMEOUT
+// ============================================================
+
+unsigned long lastMotionTime = 0;
+
+// Keep full brightness this long after motion
+const unsigned long MOTION_HOLD_TIME = 10000;
+
+// ============================================================
+// SEND TIMER
+// ============================================================
+
+unsigned long lastSendTime = 0;
+
+const unsigned long SEND_INTERVAL = 1000;
+
+// ============================================================
+// SENSOR TIMER
+// ============================================================
+
+unsigned long lastSensorRead = 0;
+
+const unsigned long SENSOR_INTERVAL = 100;
+
+// ============================================================
+// DISPLAY TIMER
+// ============================================================
+
+unsigned long lastOLEDUpdate = 0;
+
+const unsigned long OLED_INTERVAL = 500;
+
+// ============================================================
+// WIFI TIMER
+// ============================================================
+
+unsigned long lastWiFiCheck = 0;
+
+const unsigned long WIFI_CHECK_INTERVAL = 5000;
+
+// ============================================================
+// BUTTON
+// ============================================================
+
+bool lastButtonState = HIGH;
+
+unsigned long lastButtonPress = 0;
+
+const unsigned long BUTTON_DEBOUNCE = 250;
+
+// ============================================================
+// ENERGY SAVING
+// ============================================================
+
+float estimatedEnergySaving = 0.0;
+
+// ============================================================
+// WIFI CONNECT
+// ============================================================
+
+void connectWiFi()
+{
+  Serial.println();
+  Serial.println("Connecting to Wi-Fi...");
+
+  WiFi.mode(WIFI_STA);
+
+  WiFi.begin(
+    WIFI_SSID,
+    WIFI_PASSWORD
+  );
+
+  unsigned long startTime =
+    millis();
+
+  while (
+    WiFi.status() != WL_CONNECTED &&
+    millis() - startTime < 20000
+  )
+  {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+
+  if (
+    WiFi.status() ==
+    WL_CONNECTED
+  )
+  {
+    Serial.println(
+      "Wi-Fi connected!"
+    );
+
+    Serial.print(
+      "Lighting Node IP: "
+    );
+
+    Serial.println(
+      WiFi.localIP()
+    );
+
+    Serial.print(
+      "RSSI: "
+    );
+
+    Serial.println(
+      WiFi.RSSI()
+    );
+  }
+  else
+  {
+    Serial.println(
+      "Wi-Fi connection FAILED"
+    );
+  }
+}
+
+// ============================================================
+// READ LDR
+// ============================================================
+
+float readLDRPercent()
+{
+  const int samples = 10;
+
+  long total = 0;
+
+  for (
+    int i = 0;
+    i < samples;
+    i++
+  )
+  {
+    total += analogRead(LDR_PIN);
+
+    delayMicroseconds(300);
+  }
+
+  float average =
+    (float)total /
+    samples;
+
+  /*
+    Convert ADC value to approximate
+    ambient-light percentage.
+
+    This mapping depends on the actual LDR
+    circuit and must be calibrated.
+
+    If your LDR voltage is opposite,
+    reverse the mapping.
+  */
+
+  float percentage =
+    (average /
+     ADC_MAX) *
+    100.0;
+
+  if (percentage < 0)
+    percentage = 0;
+
+  if (percentage > 100)
+    percentage = 100;
+
+  return percentage;
+}
+
+// ============================================================
+// READ POTENTIOMETER
+// ============================================================
+
+int readPotentiometer()
+{
+  const int samples = 10;
+
+  long total = 0;
+
+  for (
+    int i = 0;
+    i < samples;
+    i++
+  )
+  {
+    total += analogRead(POT_PIN);
+
+    delayMicroseconds(300);
+  }
+
+  float average =
+    (float)total /
+    samples;
+
+  /*
+    Potentiometer controls idle brightness
+    from 20% to 60%.
+  */
+
+  int value =
+    map(
+      (int)average,
+      0,
+      ADC_MAX,
+      20,
+      60
+    );
+
+  if (value < 20)
+    value = 20;
+
+  if (value > 60)
+    value = 60;
+
+  return value;
+}
+
+// ============================================================
+// READ PIR
+// ============================================================
+
+bool readPIR()
+{
+  return (
+    digitalRead(PIR_PIN)
+    == HIGH
+  );
+}
+
+// ============================================================
+// READ VIBRATION
+// ============================================================
+
+bool readVibration()
+{
+  return (
+    digitalRead(VIBRATION_PIN)
+    == HIGH
+  );
+}
+
+// ============================================================
+// READ ULTRASONIC
+// ============================================================
+
+float readUltrasonic()
+{
+  digitalWrite(
+    ULTRASONIC_TRIG,
+    LOW
+  );
+
+  delayMicroseconds(2);
+
+  digitalWrite(
+    ULTRASONIC_TRIG,
+    HIGH
+  );
+
+  delayMicroseconds(10);
+
+  digitalWrite(
+    ULTRASONIC_TRIG,
+    LOW
+  );
+
+  unsigned long duration =
+    pulseIn(
+      ULTRASONIC_ECHO,
+      HIGH,
+      30000
+    );
+
+  if (duration == 0)
+  {
+    return 999.0;
+  }
+
+  float distance =
+    duration * 0.0343 / 2.0;
+
+  if (
+    distance < 2 ||
+    distance > 400
+  )
+  {
+    return 999.0;
+  }
+
+  return distance;
+}
+
+// ============================================================
+// DETERMINE NIGHT MODE
+// ============================================================
+
+void determineNightMode()
+{
+  /*
+    This is a starting threshold.
+
+    The actual threshold must be calibrated
+    using the real LDR circuit.
+  */
+
+  float rawLDR =
+    ambientLightPercent;
+
+  /*
+    Here we assume:
+
+      Lower percentage = darker
+
+    If your LDR circuit behaves in reverse,
+    change this logic.
+  */
+
+  nightMode =
+    rawLDR < 35.0;
+}
+
+// ============================================================
+// PROCESS MOTION
+// ============================================================
+
+void processMotion()
+{
+  bool previousMotion =
+    motionDetected;
+
+  motionDetected =
+    readPIR();
+
+  // ========================================================
+  // NEW MOTION EVENT
+  // ========================================================
+
+  if (
+    motionDetected &&
+    !previousMotion
+  )
+  {
+    lastMotionTime =
+      millis();
+
+    // Start safety measurement
+    motionStartTime =
+      millis();
+
+    measuringLatency = true;
+
+    Serial.println();
+    Serial.println(
+      ">>> MOTION DETECTED"
+    );
+  }
+
+  // ========================================================
+  // MOTION STILL ACTIVE
+  // ========================================================
+
+  if (motionDetected)
+  {
+    lastMotionTime =
+      millis();
+  }
+}
+
+// ============================================================
+// CALCULATE TARGET BRIGHTNESS
+// ============================================================
+
+void calculateTargetBrightness()
+{
+  // ========================================================
+  // MANUAL MODE
+  // ========================================================
+
+  if (manualMode)
+  {
+    targetBrightness =
+      manualBrightness;
+
+    return;
+  }
+
+  // ========================================================
+  // DAYTIME
+  // ========================================================
+
+  if (!nightMode)
+  {
+    targetBrightness =
+      0;
+
+    return;
+  }
+
+  // ========================================================
+  // NIGHT + MOTION
+  // ========================================================
+
+  if (motionDetected)
+  {
+    targetBrightness =
+      FULL_BRIGHTNESS;
+
+    return;
+  }
+
+  // ========================================================
+  // KEEP FULL BRIGHTNESS AFTER MOTION
+  // ========================================================
+
+  if (
+    millis() - lastMotionTime
+    < MOTION_HOLD_TIME
+  )
+  {
+    targetBrightness =
+      FULL_BRIGHTNESS;
+
+    return;
+  }
+
+  // ========================================================
+  // NIGHT + NO MOTION
+  // ========================================================
+
+  targetBrightness =
+    idleBrightness;
+}
+
+// ============================================================
+// UPDATE BRIGHTNESS
+// ============================================================
+
+void updateBrightness()
+{
+  /*
+    Fast ramp-up when target brightness is 100%.
+  */
+
+  if (
+    targetBrightness >
+    currentBrightness
+  )
+  {
+    int step = 15;
+
+    currentBrightness += step;
+
+    if (
+      currentBrightness >
+      targetBrightness
+    )
+    {
+      currentBrightness =
+        targetBrightness;
+    }
+  }
+
+  /*
+    Slower return to idle brightness.
+  */
+
+  else if (
+    targetBrightness <
+    currentBrightness
+  )
+  {
+    int step = 5;
+
+    currentBrightness -= step;
+
+    if (
+      currentBrightness <
+      targetBrightness
+    )
+    {
+      currentBrightness =
+        targetBrightness;
+    }
+  }
+
+  if (currentBrightness < 0)
+    currentBrightness = 0;
+
+  if (currentBrightness > 100)
+    currentBrightness = 100;
+
+  // Convert 0-100 to PWM 0-255
+
+  int pwmValue =
+    map(
+      currentBrightness,
+      0,
+      100,
+      0,
+      255
+    );
+
+  ledcWrite(
+    LED_PIN,
+    pwmValue
+  );
+}
+
+// ============================================================
+// SAFETY LATENCY
+// ============================================================
+
+void checkSafetyLatency()
+{
+  if (
+    measuringLatency &&
+    currentBrightness >= 100
+  )
+  {
+    safetyLatency =
+      millis() -
+      motionStartTime;
+
+    measuringLatency = false;
+
+    Serial.print(
+      "SAFETY LATENCY: "
+    );
+
+    Serial.print(
+      safetyLatency
+    );
+
+    Serial.println(
+      " ms"
+    );
+  }
+}
+
+// ============================================================
+// ENERGY SAVING ESTIMATE
+// ============================================================
+
+void calculateEnergySaving()
+{
+  /*
+    This is an ESTIMATE based on brightness.
+
+    It is not the final measured energy saving.
+
+    Assuming full brightness is the baseline:
+
+      Saving = 1 - average brightness / 100
+
+    For the final hackathon result we should use
+    actual electrical energy measurements.
+  */
+
+  float brightnessFraction =
+    currentBrightness /
+    100.0;
+
+  estimatedEnergySaving =
+    (1.0 -
+     brightnessFraction) *
+    100.0;
+
+  if (
+    estimatedEnergySaving < 0
+  )
+  {
+    estimatedEnergySaving = 0;
+  }
+
+  if (
+    estimatedEnergySaving > 100
+  )
+  {
+    estimatedEnergySaving = 100;
+  }
+}
+
+// ============================================================
+// SEND DATA TO MAIN ESP32
+// ============================================================
+
+void sendLightingData()
+{
+  char packet[220];
+
+  snprintf(
+    packet,
+    sizeof(packet),
+
+    "LIGHT,%.0f,%d,%.1f,%d,%d,%d,%.1f,%d",
+
+    ambientLightPercent,
+
+    motionDetected ? 1 : 0,
+
+    distanceCM,
+
+    currentBrightness,
+
+    vibrationDetected ? 1 : 0,
+
+    safetyLatency,
+
+    estimatedEnergySaving,
+
+    WiFi.RSSI()
+  );
+
+  udp.beginPacket(
+    broadcastIP,
+    UDP_PORT
+  );
+
+  udp.print(packet);
+
+  udp.endPacket();
+
+  Serial.print(
+    "LIGHT DATA SENT: "
+  );
+
+  Serial.println(packet);
+}
+
+// ============================================================
+// RECEIVE MAIN ESP32 CONTROL
+// ============================================================
+
+void receiveControl()
+{
+  int packetSize =
+    udp.parsePacket();
+
+  if (packetSize <= 0)
+    return;
+
+  char packet[120];
+
+  int len =
+    udp.read(
+      packet,
+      sizeof(packet) - 1
+    );
+
+  if (len <= 0)
+    return;
+
+  packet[len] =
+    '\0';
+
+  Serial.print(
+    "CONTROL RX: "
+  );
+
+  Serial.println(packet);
+
+  // ========================================================
+  // AUTO MODE
+  // ========================================================
+
+  if (
+    strcmp(
+      packet,
+      "CONTROL,AUTO,0"
+    ) == 0
+  )
+  {
+    manualMode = false;
+
+    Serial.println(
+      "Lighting mode: AUTO"
+    );
+
+    return;
+  }
+
+  // ========================================================
+  // MANUAL MODE
+  //
+  // CONTROL,MANUAL,VALUE
+  // ========================================================
+
+  if (
+    strncmp(
+      packet,
+      "CONTROL,MANUAL,",
+      15
+    ) == 0
+  )
+  {
+    int value =
+      atoi(
+        packet + 15
+      );
+
+    if (value < 0)
+      value = 0;
+
+    if (value > 100)
+      value = 100;
+
+    manualBrightness =
+      value;
+
+    manualMode =
+      true;
+
+    Serial.print(
+      "Manual brightness = "
+    );
+
+    Serial.print(
+      manualBrightness
+    );
+
+    Serial.println("%");
+  }
+}
+
+// ============================================================
+// LOCAL BRIGHTNESS BUTTON
+// ============================================================
+
+void handleAdjustButton()
+{
+  bool currentState =
+    digitalRead(
+      ADJUST_BUTTON
+    );
+
+  if (
+    lastButtonState == HIGH &&
+    currentState == LOW
+  )
+  {
+    if (
+      millis() -
+      lastButtonPress >
+      BUTTON_DEBOUNCE
+    )
+    {
+      lastButtonPress =
+        millis();
+
+      /*
+        Step through:
+
+        20
+        40
+        60
+        80
+        100
+        20
+      */
+
+      idleBrightness += 20;
+
+      if (
+        idleBrightness > 100
+      )
+      {
+        idleBrightness = 20;
+      }
+
+      Serial.print(
+        "Idle brightness set to "
+      );
+
+      Serial.print(
+        idleBrightness
+      );
+
+      Serial.println("%");
+    }
+  }
+
+  lastButtonState =
+    currentState;
+}
+
+// ============================================================
+// OLED HEADER
+// ============================================================
+
+void oledLine(
+  int y,
+  const char* label,
+  String value
+)
+{
+  display.setCursor(
+    0,
+    y
+  );
+
+  display.print(
+    label
+  );
+
+  display.print(
+    value
+  );
+}
+
+// ============================================================
+// UPDATE OLED
+// ============================================================
+
+void updateOLED()
+{
+  display.clearDisplay();
+
+  display.setTextColor(
+    SSD1306_WHITE
+  );
+
+  display.setTextSize(1);
+
+  display.setCursor(
+    0,
+    0
+  );
+
+  display.println(
+    "LIGHTING NODE"
+  );
+
+  display.drawLine(
+    0,
+    9,
+    127,
+    9,
+    SSD1306_WHITE
+  );
+
+  // --------------------------------------------------------
+  // Ambient
+  // --------------------------------------------------------
+
+  oledLine(
+    12,
+    "LDR   : ",
+    String(
+      ambientLightPercent,
+      0
+    ) + "%"
+  );
+
+  // --------------------------------------------------------
+  // PIR
+  // --------------------------------------------------------
+
+  oledLine(
+    23,
+    "PIR   : ",
+    motionDetected
+      ? "ACTIVE"
+      : "NONE"
+  );
+
+  // --------------------------------------------------------
+  // Distance
+  // --------------------------------------------------------
+
+  if (
+    distanceCM >= 999
+  )
+  {
+    oledLine(
+      34,
+      "DIST  : ",
+      "---"
+    );
+  }
+  else
+  {
+    oledLine(
+      34,
+      "DIST  : ",
+      String(
+        distanceCM,
+        1
+      ) + "cm"
+    );
+  }
+
+  // --------------------------------------------------------
+  // Brightness
+  // --------------------------------------------------------
+
+  oledLine(
+    45,
+    "LIGHT : ",
+    String(
+      currentBrightness
+    ) + "%"
+  );
+
+  // --------------------------------------------------------
+  // Mode
+  // --------------------------------------------------------
+
+  oledLine(
+    56,
+    "MODE  : ",
+    manualMode
+      ? "MANUAL"
+      : "AUTO"
+  );
+
+  display.display();
+}
+
+// ============================================================
+// SERIAL DEBUG
+// ============================================================
+
+void printStatus()
+{
+  Serial.println();
+  Serial.println(
+    "======================================"
+  );
+
+  Serial.println(
+    "      LIGHTING NODE STATUS"
+  );
+
+  Serial.println(
+    "======================================"
+  );
+
+  Serial.print(
+    "Ambient Light : "
+  );
+
+  Serial.print(
+    ambientLightPercent
+  );
+
+  Serial.println("%");
+
+  Serial.print(
+    "Night Mode    : "
+  );
+
+  Serial.println(
+    nightMode
+      ? "YES"
+      : "NO"
+  );
+
+  Serial.print(
+    "PIR Motion    : "
+  );
+
+  Serial.println(
+    motionDetected
+      ? "DETECTED"
+      : "NONE"
+  );
+
+  Serial.print(
+    "Distance      : "
+  );
+
+  Serial.print(
+    distanceCM,
+    1
+  );
+
+  Serial.println(
+    " cm"
+  );
+
+  Serial.print(
+    "Vibration     : "
+  );
+
+  Serial.println(
+    vibrationDetected
+      ? "DETECTED"
+      : "NORMAL"
+  );
+
+  Serial.print(
+    "Idle Bright.  : "
+  );
+
+  Serial.print(
+    idleBrightness
+  );
+
+  Serial.println("%");
+
+  Serial.print(
+    "Target Light  : "
+  );
+
+  Serial.print(
+    targetBrightness
+  );
+
+  Serial.println("%");
+
+  Serial.print(
+    "Current Light : "
+  );
+
+  Serial.print(
+    currentBrightness
+  );
+
+  Serial.println("%");
+
+  Serial.print(
+    "Safety Latency: "
+  );
+
+  Serial.print(
+    safetyLatency
+  );
+
+  Serial.println(
+    " ms"
+  );
+
+  Serial.print(
+    "Energy Saving : "
+  );
+
+  Serial.print(
+    estimatedEnergySaving,
+    1
+  );
+
+  Serial.println("%");
+
+  Serial.print(
+    "Wi-Fi RSSI    : "
+  );
+
+  Serial.print(
+    WiFi.RSSI()
+  );
+
+  Serial.println(
+    " dBm"
+  );
+
+  Serial.println(
+    "======================================"
+  );
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup()
+{
+  Serial.begin(
+    115200
+  );
+
+  delay(1000);
+
+  Serial.println();
+  Serial.println();
+  Serial.println(
+    "============================================"
+  );
+
+  Serial.println(
+    " SMART ADAPTIVE STREET LIGHTING"
+  );
+
+  Serial.println(
+    " MINI ESP32-C3 #2"
+  );
+
+  Serial.println(
+    " INTELLIGENT LIGHTING NODE"
+  );
+
+  Serial.println(
+    "============================================"
+  );
+
+  // ========================================================
+  // SENSOR PINS
+  // ========================================================
+
+  pinMode(
+    LDR_PIN,
+    INPUT
+  );
+
+  pinMode(
+    POT_PIN,
+    INPUT
+  );
+
+  pinMode(
+    PIR_PIN,
+    INPUT
+  );
+
+  pinMode(
+    VIBRATION_PIN,
+    INPUT
+  );
+
+  pinMode(
+    ULTRASONIC_TRIG,
+    OUTPUT
+  );
+
+  pinMode(
+    ULTRASONIC_ECHO,
+    INPUT
+  );
+
+  // ========================================================
+  // BUTTON
+  // ========================================================
+
+  pinMode(
+    ADJUST_BUTTON,
+    INPUT_PULLUP
+  );
+
+  // ========================================================
+  // ADC
+  // ========================================================
+
+  analogReadResolution(12);
+
+  analogSetPinAttenuation(
+    LDR_PIN,
+    ADC_11db
+  );
+
+  analogSetPinAttenuation(
+    POT_PIN,
+    ADC_11db
+  );
+
+  // ========================================================
+  // LED PWM
+  // ========================================================
+
+  ledcAttach(
+    LED_PIN,
+    PWM_FREQUENCY,
+    PWM_RESOLUTION
+  );
+
+  ledcWrite(
+    LED_PIN,
+    0
+  );
+
+  // ========================================================
+  // OLED
+  // ========================================================
+
+  Wire.begin(
+    OLED_SDA,
+    OLED_SCL
+  );
+
+  if (
+    display.begin(
+      SSD1306_SWITCHCAPVCC,
+      0x3C
+    )
+  )
+  {
+    Serial.println(
+      "OLED initialized."
+    );
+
+    display.clearDisplay();
+
+    display.setTextColor(
+      SSD1306_WHITE
+    );
+
+    display.setTextSize(1);
+
+    display.setCursor(
+      10,
+      20
+    );
+
+    display.println(
+      "LIGHTING NODE"
+    );
+
+    display.setCursor(
+      10,
+      35
+    );
+
+    display.println(
+      "INITIALIZING..."
+    );
+
+    display.display();
+
+    delay(1000);
+  }
+  else
+  {
+    Serial.println(
+      "OLED not detected."
+    );
+  }
+
+  // ========================================================
+  // WIFI
+  // ========================================================
+
+  connectWiFi();
+
+  // ========================================================
+  // UDP
+  // ========================================================
+
+  udp.begin(
+    UDP_PORT
+  );
+
+  Serial.print(
+    "UDP listening on port "
+  );
+
+  Serial.println(
+    UDP_PORT
+  );
+
+  // ========================================================
+  // START VALUES
+  // ========================================================
+
+  idleBrightness =
+    readPotentiometer();
+
+  currentBrightness =
+    0;
+
+  targetBrightness =
+    0;
+
+  Serial.println();
+  Serial.println(
+    "LIGHTING NODE READY."
+  );
+
+  printStatus();
+}
+
+// ============================================================
+// LOOP
+// ============================================================
+
+void loop()
+{
+  unsigned long now =
+    millis();
+
+  // ========================================================
+  // RECEIVE MAIN ESP32 COMMANDS
+  // ========================================================
+
+  receiveControl();
+
+  // ========================================================
+  // READ SENSORS
+  // ========================================================
+
+  if (
+    now - lastSensorRead >=
+    SENSOR_INTERVAL
+  )
+  {
+    lastSensorRead =
+      now;
+
+    // LDR
+    ambientLightPercent =
+      readLDRPercent();
+
+    // POT
+    if (!manualMode)
+    {
+      idleBrightness =
+        readPotentiometer();
+    }
+
+    // PIR
+    processMotion();
+
+    // Vibration
+    vibrationDetected =
+      readVibration();
+
+    // Ultrasonic
+    distanceCM =
+      readUltrasonic();
+
+    // Determine day/night
+    determineNightMode();
+  }
+
+  // ========================================================
+  // LOCAL BUTTON
+  // ========================================================
+
+  handleAdjustButton();
+
+  // ========================================================
+  // CONTROL LOGIC
+  // ========================================================
+
+  calculateTargetBrightness();
+
+  // ========================================================
+  // BRIGHTNESS
+  // ========================================================
+
+  updateBrightness();
+
+  // ========================================================
+  // SAFETY
+  // ========================================================
+
+  checkSafetyLatency();
+
+  // ========================================================
+  // ENERGY SAVING ESTIMATE
+  // ========================================================
+
+  calculateEnergySaving();
+
+  // ========================================================
+  // SEND TO MAIN ESP32
+  // ========================================================
+
+  if (
+    now - lastSendTime >=
+    SEND_INTERVAL
+  )
+  {
+    lastSendTime =
+      now;
+
+    if (
+      WiFi.status() ==
+      WL_CONNECTED
+    )
+    {
+      sendLightingData();
+    }
+  }
+
+  // ========================================================
+  // OLED
+  // ========================================================
+
+  if (
+    now - lastOLEDUpdate >=
+    OLED_INTERVAL
+  )
+  {
+    lastOLEDUpdate =
+      now;
+
+    updateOLED();
+  }
+
+  // ========================================================
+  // WIFI
+  // ========================================================
+
+  if (
+    now - lastWiFiCheck >=
+    WIFI_CHECK_INTERVAL
+  )
+  {
+    lastWiFiCheck =
+      now;
+
+    if (
+      WiFi.status() !=
+      WL_CONNECTED
+    )
+    {
+      connectWiFi();
+    }
+  }
+
+  // ========================================================
+  // SERIAL DEBUG
+  // ========================================================
+
+  static unsigned long lastDebug =
+    0;
+
+  if (
+    now - lastDebug >=
+    3000
+  )
+  {
+    lastDebug =
+      now;
+
+    printStatus();
+  }
+
+  delay(5);
+}
