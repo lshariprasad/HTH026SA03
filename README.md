@@ -282,29 +282,29 @@ Quantities are marked `TBD` where they are not yet confirmed.
 |---|---|---|---|
 | Main ESP32 | 1 | Central controller and gateway | Main |
 | Mini ESP32-C3 | 2 | Energy Node and Lighting Node controllers | Energy / Lighting |
-| ST7735 TFT display | TBD | Central monitoring UI | Main |
-| OLED display (SSD1306-class) | TBD | Local lighting status | Lighting |
-| PIR sensor | TBD | Motion detection | Lighting |
-| LDR | TBD | Ambient-light sensing | Lighting |
-| Ultrasonic sensor (HC-SR04-class) | TBD | Distance / approach detection | Lighting |
-| Vibration sensor | TBD | Physical disturbance / infrastructure monitoring | Lighting |
-| Potentiometer | TBD | Manual idle-brightness adjustment | Lighting |
-| LED(s) | TBD | Street-light prototype output | Lighting |
-| Current sensor | TBD | Current measurement (series) | Energy |
-| Voltage sensor | TBD | Voltage measurement (parallel) | Energy |
-| Piezoelectric disk | TBD | Supplementary micro-energy harvesting experiment | Energy |
-| Li-ion battery | TBD | Energy storage | Energy |
-| Charging module | TBD | Safe Li-ion charging | Energy |
-| Boost converter | TBD | Voltage step-up | Energy |
-| Buck converter | TBD | Voltage step-down | Energy |
-| DC-DC multi-power module | TBD | Power regulation | Energy |
-| Single-channel relay | TBD | Load / power-path switching (role to be confirmed) | Energy / Lighting |
+| ST7735 TFT display | 1 | Central monitoring UI | Main |
+| OLED display (SSD1306-class) | 1 | Local lighting status | Lighting |
+| PIR sensor | 1 | Motion detection | Lighting |
+| LDR | 1 | Ambient-light sensing | Lighting |
+| Ultrasonic sensor (HC-SR04-class) | 1 | Distance / approach detection | Lighting |
+| Vibration sensor | 1 | Physical disturbance / infrastructure monitoring | Lighting |
+| Potentiometer | 1 | Manual idle-brightness adjustment | Lighting |
+| LED(s) | 3 | Street-light prototype output | Lighting |
+| Current sensor | 1 | Current measurement (series) | Energy |
+| Voltage sensor | 1 | Voltage measurement (parallel) | Energy |
+| Piezoelectric disk | 1 | Supplementary micro-energy harvesting experiment | Energy |
+| Li-ion battery | 1 | Energy storage | Energy |
+| Charging module | 1 | Safe Li-ion charging | Energy |
+| Boost converter | 1 | Voltage step-up | Energy |
+| Buck converter | 1 | Voltage step-down | Energy |
+| DC-DC multi-power module | 1 | Power regulation | Energy |
+| Single-channel relay | 1 | Load / power-path switching (role to be confirmed) | Energy / Lighting |
 | Push buttons | 4+ (Main), 1 (Lighting) | Navigation, mode control, brightness step | Main / Lighting |
-| Buzzer | TBD | Alerts | Main |
-| Capacitor(s) | TBD | Energy buffering | Energy |
-| Fuse | TBD | Overcurrent protection | Energy |
-| Breadboard | TBD | Prototyping | All |
-| Wires / supporting components | TBD | Interconnects, resistors, transistor/MOSFET driver, level shifting | All |
+| Buzzer | 2 | Alerts | Main |
+| Capacitor(s) | 1 | Energy buffering | Energy |
+| Fuse | 1 | Overcurrent protection | Energy |
+| Breadboard | 1 | Prototyping | All |
+| Wires / supporting components | - | Interconnects, resistors, transistor/MOSFET driver, level shifting | All |
 
 ### Software stack
 
