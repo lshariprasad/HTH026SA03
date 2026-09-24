@@ -1,0 +1,1370 @@
+/************************************************************
+   SMART ADAPTIVE STREET LIGHTING
+   HTH-SA-06
+
+   MAIN ESP32
+   ----------------------------------------------------------
+   TFT ST7735
+   4 BUTTONS
+   BUZZER
+   Wi-Fi
+   Blynk Web Dashboard
+   UDP communication with:
+      Mini ESP32-C3 #1 -> Energy Node
+      Mini ESP32-C3 #2 -> Lighting Node
+
+   ----------------------------------------------------------
+   TFT PINS
+   CS   = GPIO 15
+   DC   = GPIO 2
+   RST  = GPIO 4
+   SCLK = GPIO 18
+   MOSI = GPIO 23
+
+   BUTTONS
+   B1 = GPIO 12
+   B2 = GPIO 13
+   B3 = GPIO 14
+   B4 = GPIO 26
+
+   BUZZER
+   GPIO 27
+
+   ----------------------------------------------------------
+   BLYNK DATastreams
+   V0  Battery Voltage
+   V1  Current
+   V2  Power
+   V3  Battery
+   V4  Energy Consumed
+
+   V5  Ambient Light
+   V6  Motion
+   V7  Distance
+   V8  Brightness
+   V9  Vibration
+
+   V10 Safety Latency
+   V11 Energy Saving
+
+   V24 Main Node Status
+   V25 Energy Node Status
+   V26 Lighting Node Status
+   V27 Operating Mode
+   V28 Manual Brightness
+   V29 Auto Manual Control
+   V30 Reset Energy
+ ************************************************************/
+
+#define BLYNK_PRINT Serial
+
+// ==========================================================
+// BLYNK CONFIGURATION
+// ==========================================================
+// IMPORTANT:
+// Copy these from your Blynk template/device.
+//
+// Example:
+// #define BLYNK_TEMPLATE_ID "TMPLxxxxxxxx"
+// #define BLYNK_TEMPLATE_NAME "Smart Adaptive Street Lighting"
+// #define BLYNK_AUTH_TOKEN "YourDeviceAuthToken"
+
+#define BLYNK_TEMPLATE_ID   "YOUR_TEMPLATE_ID"
+#define BLYNK_TEMPLATE_NAME "Smart Adaptive Street Lighting"
+#define BLYNK_AUTH_TOKEN    "YOUR_MAIN_ESP32_AUTH_TOKEN"
+
+// ==========================================================
+// LIBRARIES
+// ==========================================================
+#include <WiFi.h>
+#include <WiFiUdp.h>
+
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7735.h>
+
+#include <BlynkSimpleEsp32.h>
+
+// ==========================================================
+// WIFI
+// ==========================================================
+char ssid[] = "ls_hariprasad";
+char pass[] = "HARIDEVAN@1410";
+
+// ==========================================================
+// TFT PINS
+// ==========================================================
+#define TFT_CS    15
+#define TFT_DC     2
+#define TFT_RST    4
+#define TFT_SCLK  18
+#define TFT_MOSI  23
+
+// ==========================================================
+// BUTTON PINS
+// ==========================================================
+#define BUTTON1 12
+#define BUTTON2 13
+#define BUTTON3 14
+#define BUTTON4 26
+
+const uint8_t buttonPins[4] =
+{
+  BUTTON1,
+  BUTTON2,
+  BUTTON3,
+  BUTTON4
+};
+
+bool lastButtonState[4] =
+{
+  HIGH,
+  HIGH,
+  HIGH,
+  HIGH
+};
+
+// ==========================================================
+// BUZZER
+// ==========================================================
+#define BUZZER_PIN 27
+
+bool buzzerActive = false;
+unsigned long buzzerStart = 0;
+unsigned long buzzerDuration = 0;
+
+// ==========================================================
+// TFT OBJECT
+// ==========================================================
+Adafruit_ST7735 tft =
+  Adafruit_ST7735(
+    TFT_CS,
+    TFT_DC,
+    TFT_RST
+  );
+
+// ==========================================================
+// UDP
+// ==========================================================
+WiFiUDP udp;
+
+const uint16_t UDP_PORT = 4210;
+
+IPAddress broadcastIP(255, 255, 255, 255);
+
+// ==========================================================
+// BLYNK TIMER
+// ==========================================================
+BlynkTimer timer;
+
+// ==========================================================
+// SYSTEM PAGE
+// ==========================================================
+uint8_t currentPage = 0;
+
+// 0 = OVERVIEW
+// 1 = ENERGY
+// 2 = LIGHTING
+// 3 = SYSTEM
+
+// ==========================================================
+// OPERATING MODE
+// ==========================================================
+// false = AUTO
+// true  = MANUAL
+bool manualMode = false;
+
+// Manual brightness value
+int manualBrightness = 20;
+
+// ==========================================================
+// ENERGY NODE DATA
+// ==========================================================
+float energyVoltage = 0.0;
+float energyCurrent = 0.0;
+float energyPower = 0.0;
+float energyConsumed = 0.0;
+float energyBattery = 0.0;
+
+int energyRSSI = 0;
+
+bool energyNodeOnline = false;
+
+unsigned long lastEnergyPacket = 0;
+
+// ==========================================================
+// LIGHTING NODE DATA
+// ==========================================================
+float ambientLight = 0.0;
+
+int motionState = 0;
+
+float distanceCM = 0.0;
+
+int brightnessPercent = 0;
+
+int vibrationState = 0;
+
+int safetyLatency = 0;
+
+float energySaving = 0.0;
+
+int lightingRSSI = 0;
+
+bool lightingNodeOnline = false;
+
+unsigned long lastLightingPacket = 0;
+
+// ==========================================================
+// WIFI RECONNECT TIMER
+// ==========================================================
+unsigned long lastWiFiCheck = 0;
+
+// ==========================================================
+// BUZZER CONTROL
+// ==========================================================
+void beep(unsigned long duration)
+{
+  digitalWrite(BUZZER_PIN, HIGH);
+
+  buzzerActive = true;
+  buzzerStart = millis();
+  buzzerDuration = duration;
+}
+
+void serviceBuzzer()
+{
+  if (!buzzerActive)
+    return;
+
+  if (millis() - buzzerStart >= buzzerDuration)
+  {
+    digitalWrite(BUZZER_PIN, LOW);
+    buzzerActive = false;
+  }
+}
+
+// ==========================================================
+// DRAW HEADER
+// ==========================================================
+void drawHeader(const char* title)
+{
+  tft.fillScreen(ST77XX_BLACK);
+
+  tft.fillRect(
+    0,
+    0,
+    160,
+    20,
+    ST77XX_BLUE
+  );
+
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setTextSize(1);
+
+  tft.setCursor(5, 6);
+  tft.print(title);
+}
+
+// ==========================================================
+// WRITE LABEL
+// ==========================================================
+void writeLabel(
+  const char* label,
+  float value,
+  const char* unit,
+  int y
+)
+{
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setTextSize(1);
+
+  tft.setCursor(5, y);
+  tft.print(label);
+
+  tft.setCursor(80, y);
+
+  tft.print(value, 2);
+
+  tft.print(" ");
+  tft.print(unit);
+}
+
+// ==========================================================
+// OVERVIEW PAGE
+// ==========================================================
+void showOverview()
+{
+  drawHeader("SMART STREET");
+
+  tft.setTextSize(1);
+
+  // --------------------------------------------------------
+  // ENERGY
+  // --------------------------------------------------------
+  tft.setTextColor(ST77XX_CYAN);
+
+  tft.setCursor(5, 28);
+  tft.println("ENERGY NODE");
+
+  writeLabel(
+    "Battery:",
+    energyBattery,
+    "%",
+    42
+  );
+
+  writeLabel(
+    "Voltage:",
+    energyVoltage,
+    "V",
+    55
+  );
+
+  writeLabel(
+    "Power:",
+    energyPower,
+    "W",
+    68
+  );
+
+  // --------------------------------------------------------
+  // LIGHTING
+  // --------------------------------------------------------
+  tft.setTextColor(ST77XX_YELLOW);
+
+  tft.setCursor(5, 84);
+  tft.println("LIGHTING");
+
+  tft.setTextColor(ST77XX_WHITE);
+
+  tft.setCursor(5, 98);
+  tft.print("Brightness: ");
+  tft.print(brightnessPercent);
+  tft.println("%");
+
+  tft.setCursor(5, 111);
+  tft.print("Motion: ");
+
+  if (motionState)
+    tft.println("DETECTED");
+  else
+    tft.println("NONE");
+
+  // --------------------------------------------------------
+  // STATUS
+  // --------------------------------------------------------
+  tft.setCursor(5, 124);
+
+  if (energyNodeOnline && lightingNodeOnline)
+  {
+    tft.setTextColor(ST77XX_GREEN);
+    tft.println("ALL NODES ONLINE");
+  }
+  else
+  {
+    tft.setTextColor(ST77XX_RED);
+    tft.println("NODE CHECK REQUIRED");
+  }
+}
+
+// ==========================================================
+// ENERGY PAGE
+// ==========================================================
+void showEnergy()
+{
+  drawHeader("ENERGY NODE");
+
+  writeLabel(
+    "Voltage:",
+    energyVoltage,
+    "V",
+    30
+  );
+
+  writeLabel(
+    "Current:",
+    energyCurrent,
+    "A",
+    44
+  );
+
+  writeLabel(
+    "Power:",
+    energyPower,
+    "W",
+    58
+  );
+
+  writeLabel(
+    "Battery:",
+    energyBattery,
+    "%",
+    72
+  );
+
+  writeLabel(
+    "Energy:",
+    energyConsumed,
+    "Wh",
+    86
+  );
+
+  tft.setTextColor(ST77XX_CYAN);
+
+  tft.setCursor(5, 103);
+  tft.print("RSSI: ");
+
+  tft.print(energyRSSI);
+
+  tft.println(" dBm");
+
+  tft.setCursor(5, 118);
+
+  if (energyNodeOnline)
+  {
+    tft.setTextColor(ST77XX_GREEN);
+    tft.println("ENERGY NODE ONLINE");
+  }
+  else
+  {
+    tft.setTextColor(ST77XX_RED);
+    tft.println("ENERGY NODE OFFLINE");
+  }
+}
+
+// ==========================================================
+// LIGHTING PAGE
+// ==========================================================
+void showLighting()
+{
+  drawHeader("LIGHTING NODE");
+
+  writeLabel(
+    "Ambient:",
+    ambientLight,
+    "%",
+    30
+  );
+
+  tft.setTextColor(ST77XX_WHITE);
+
+  tft.setCursor(5, 44);
+  tft.print("Motion: ");
+
+  if (motionState)
+  {
+    tft.setTextColor(ST77XX_GREEN);
+    tft.print("DETECTED");
+  }
+  else
+  {
+    tft.setTextColor(ST77XX_WHITE);
+    tft.print("NONE");
+  }
+
+  writeLabel(
+    "Distance:",
+    distanceCM,
+    "cm",
+    58
+  );
+
+  tft.setTextColor(ST77XX_WHITE);
+
+  tft.setCursor(5, 72);
+  tft.print("Brightness: ");
+
+  tft.print(brightnessPercent);
+  tft.println("%");
+
+  tft.setCursor(5, 86);
+  tft.print("Vibration: ");
+
+  if (vibrationState)
+  {
+    tft.setTextColor(ST77XX_RED);
+    tft.println("DETECTED");
+  }
+  else
+  {
+    tft.setTextColor(ST77XX_GREEN);
+    tft.println("NORMAL");
+  }
+
+  tft.setTextColor(ST77XX_WHITE);
+
+  tft.setCursor(5, 100);
+  tft.print("Latency: ");
+
+  tft.print(safetyLatency);
+  tft.println(" ms");
+
+  tft.setCursor(5, 114);
+
+  if (lightingNodeOnline)
+  {
+    tft.setTextColor(ST77XX_GREEN);
+    tft.println("LIGHT NODE ONLINE");
+  }
+  else
+  {
+    tft.setTextColor(ST77XX_RED);
+    tft.println("LIGHT NODE OFFLINE");
+  }
+}
+
+// ==========================================================
+// SYSTEM PAGE
+// ==========================================================
+void showSystem()
+{
+  drawHeader("SYSTEM STATUS");
+
+  tft.setTextColor(ST77XX_WHITE);
+
+  tft.setCursor(5, 30);
+  tft.print("MAIN: ");
+
+  tft.setTextColor(ST77XX_GREEN);
+  tft.println("ONLINE");
+
+  tft.setTextColor(ST77XX_WHITE);
+
+  tft.setCursor(5, 46);
+  tft.print("ENERGY NODE: ");
+
+  if (energyNodeOnline)
+  {
+    tft.setTextColor(ST77XX_GREEN);
+    tft.println("ONLINE");
+  }
+  else
+  {
+    tft.setTextColor(ST77XX_RED);
+    tft.println("OFFLINE");
+  }
+
+  tft.setTextColor(ST77XX_WHITE);
+
+  tft.setCursor(5, 62);
+  tft.print("LIGHT NODE: ");
+
+  if (lightingNodeOnline)
+  {
+    tft.setTextColor(ST77XX_GREEN);
+    tft.println("ONLINE");
+  }
+  else
+  {
+    tft.setTextColor(ST77XX_RED);
+    tft.println("OFFLINE");
+  }
+
+  tft.setTextColor(ST77XX_WHITE);
+
+  tft.setCursor(5, 78);
+  tft.print("Wi-Fi: ");
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    tft.setTextColor(ST77XX_GREEN);
+    tft.println("CONNECTED");
+  }
+  else
+  {
+    tft.setTextColor(ST77XX_RED);
+    tft.println("DISCONNECTED");
+  }
+
+  tft.setTextColor(ST77XX_WHITE);
+
+  tft.setCursor(5, 94);
+  tft.print("MODE: ");
+
+  if (manualMode)
+    tft.println("MANUAL");
+  else
+    tft.println("AUTO");
+
+  tft.setCursor(5, 110);
+
+  tft.print("Energy Saving: ");
+
+  tft.print(energySaving, 1);
+
+  tft.println("%");
+
+  tft.setCursor(5, 124);
+
+  tft.print("Safety: ");
+
+  tft.print(safetyLatency);
+
+  tft.println(" ms");
+}
+
+// ==========================================================
+// UPDATE TFT
+// ==========================================================
+void updateTFT()
+{
+  if (currentPage == 0)
+  {
+    showOverview();
+  }
+  else if (currentPage == 1)
+  {
+    showEnergy();
+  }
+  else if (currentPage == 2)
+  {
+    showLighting();
+  }
+  else if (currentPage == 3)
+  {
+    showSystem();
+  }
+}
+
+// ==========================================================
+// SEND CONTROL TO LIGHTING NODE
+// ==========================================================
+void sendLightingControl()
+{
+  char packet[80];
+
+  if (manualMode)
+  {
+    snprintf(
+      packet,
+      sizeof(packet),
+      "CONTROL,MANUAL,%d",
+      manualBrightness
+    );
+  }
+  else
+  {
+    snprintf(
+      packet,
+      sizeof(packet),
+      "CONTROL,AUTO,0"
+    );
+  }
+
+  udp.beginPacket(
+    broadcastIP,
+    UDP_PORT
+  );
+
+  udp.print(packet);
+
+  udp.endPacket();
+
+  Serial.print("CONTROL SENT: ");
+  Serial.println(packet);
+}
+
+// ==========================================================
+// RECEIVE UDP PACKETS
+// ==========================================================
+void receiveUDP()
+{
+  int packetSize = udp.parsePacket();
+
+  if (packetSize <= 0)
+    return;
+
+  char packet[220];
+
+  int len =
+    udp.read(
+      packet,
+      sizeof(packet) - 1
+    );
+
+  if (len <= 0)
+    return;
+
+  packet[len] = '\0';
+
+  Serial.print("UDP RX: ");
+  Serial.println(packet);
+
+  // ========================================================
+  // ENERGY PACKET
+  //
+  // ENERGY,V,I,P,E,BATTERY,RSSI
+  // ========================================================
+  if (strncmp(packet, "ENERGY,", 7) == 0)
+  {
+    float v;
+    float i;
+    float p;
+    float e;
+    float b;
+    int rssi;
+
+    int result =
+      sscanf(
+        packet,
+        "ENERGY,%f,%f,%f,%f,%f,%d",
+        &v,
+        &i,
+        &p,
+        &e,
+        &b,
+        &rssi
+      );
+
+    if (result == 6)
+    {
+      energyVoltage = v;
+      energyCurrent = i;
+      energyPower = p;
+      energyConsumed = e;
+      energyBattery = b;
+      energyRSSI = rssi;
+
+      energyNodeOnline = true;
+      lastEnergyPacket = millis();
+
+      Serial.println("Energy data updated.");
+
+      // Short notification beep
+      beep(40);
+    }
+  }
+
+  // ========================================================
+  // LIGHTING PACKET
+  //
+  // LIGHT,AMBIENT,MOTION,DISTANCE,BRIGHTNESS,
+  // VIBRATION,LATENCY,SAVING,RSSI
+  // ========================================================
+  else if (strncmp(packet, "LIGHT,", 6) == 0)
+  {
+    float amb;
+    int mot;
+    float dist;
+    int bright;
+    int vib;
+    int latency;
+    float saving;
+    int rssi;
+
+    int result =
+      sscanf(
+        packet,
+        "LIGHT,%f,%d,%f,%d,%d,%d,%f,%d",
+        &amb,
+        &mot,
+        &dist,
+        &bright,
+        &vib,
+        &latency,
+        &saving,
+        &rssi
+      );
+
+    if (result == 8)
+    {
+      ambientLight = amb;
+      motionState = mot;
+      distanceCM = dist;
+      brightnessPercent = bright;
+      vibrationState = vib;
+      safetyLatency = latency;
+      energySaving = saving;
+      lightingRSSI = rssi;
+
+      lightingNodeOnline = true;
+      lastLightingPacket = millis();
+
+      Serial.println("Lighting data updated.");
+
+      // Buzzer for new motion event
+      if (motionState == 1)
+      {
+        beep(80);
+      }
+    }
+  }
+}
+
+// ==========================================================
+// BUTTON 1
+// OVERVIEW
+// ==========================================================
+void button1Action()
+{
+  currentPage = 0;
+
+  updateTFT();
+
+  beep(60);
+
+  Serial.println("B1 -> OVERVIEW");
+}
+
+// ==========================================================
+// BUTTON 2
+// ENERGY
+// ==========================================================
+void button2Action()
+{
+  currentPage = 1;
+
+  updateTFT();
+
+  beep(60);
+
+  Serial.println("B2 -> ENERGY");
+}
+
+// ==========================================================
+// BUTTON 3
+// LIGHTING
+// ==========================================================
+void button3Action()
+{
+  currentPage = 2;
+
+  updateTFT();
+
+  beep(60);
+
+  Serial.println("B3 -> LIGHTING");
+}
+
+// ==========================================================
+// BUTTON 4
+// AUTO / MANUAL
+// ==========================================================
+void button4Action()
+{
+  manualMode = !manualMode;
+
+  if (manualMode)
+  {
+    Serial.println("MODE -> MANUAL");
+
+    beep(120);
+  }
+  else
+  {
+    Serial.println("MODE -> AUTO");
+
+    beep(250);
+  }
+
+  sendLightingControl();
+
+  currentPage = 3;
+
+  updateTFT();
+}
+
+// ==========================================================
+// BUTTON HANDLING
+// ==========================================================
+void handleButtons()
+{
+  for (int i = 0; i < 4; i++)
+  {
+    bool currentState =
+      digitalRead(buttonPins[i]);
+
+    if (
+      lastButtonState[i] == HIGH &&
+      currentState == LOW
+    )
+    {
+      if (i == 0)
+        button1Action();
+
+      else if (i == 1)
+        button2Action();
+
+      else if (i == 2)
+        button3Action();
+
+      else if (i == 3)
+        button4Action();
+    }
+
+    lastButtonState[i] =
+      currentState;
+  }
+}
+
+// ==========================================================
+// BLYNK - MANUAL BRIGHTNESS
+// V28
+// ==========================================================
+BLYNK_WRITE(V28)
+{
+  int value = param.asInt();
+
+  if (value < 20)
+    value = 20;
+
+  if (value > 100)
+    value = 100;
+
+  manualBrightness = value;
+
+  Serial.print("Blynk Manual Brightness: ");
+  Serial.println(manualBrightness);
+
+  if (manualMode)
+  {
+    sendLightingControl();
+  }
+}
+
+// ==========================================================
+// BLYNK - AUTO/MANUAL
+// V29
+// ==========================================================
+BLYNK_WRITE(V29)
+{
+  int value = param.asInt();
+
+  manualMode = (value == 1);
+
+  Serial.print("Blynk Mode: ");
+
+  if (manualMode)
+  {
+    Serial.println("MANUAL");
+  }
+  else
+  {
+    Serial.println("AUTO");
+  }
+
+  sendLightingControl();
+
+  updateTFT();
+}
+
+// ==========================================================
+// BLYNK - RESET ENERGY
+// V30
+// ==========================================================
+BLYNK_WRITE(V30)
+{
+  int value = param.asInt();
+
+  if (value == 1)
+  {
+    energyConsumed = 0.0;
+
+    Serial.println("Energy counter reset.");
+
+    Blynk.virtualWrite(
+      V4,
+      energyConsumed
+    );
+
+    beep(200);
+
+    updateTFT();
+  }
+}
+
+// ==========================================================
+// SEND ALL DATA TO BLYNK
+// ==========================================================
+void sendBlynkData()
+{
+  // --------------------------------------------------------
+  // ENERGY
+  // --------------------------------------------------------
+  Blynk.virtualWrite(
+    V0,
+    energyVoltage
+  );
+
+  Blynk.virtualWrite(
+    V1,
+    energyCurrent
+  );
+
+  Blynk.virtualWrite(
+    V2,
+    energyPower
+  );
+
+  Blynk.virtualWrite(
+    V3,
+    (int)energyBattery
+  );
+
+  Blynk.virtualWrite(
+    V4,
+    energyConsumed
+  );
+
+  // --------------------------------------------------------
+  // LIGHTING
+  // --------------------------------------------------------
+  Blynk.virtualWrite(
+    V5,
+    (int)ambientLight
+  );
+
+  Blynk.virtualWrite(
+    V6,
+    motionState
+  );
+
+  Blynk.virtualWrite(
+    V7,
+    distanceCM
+  );
+
+  Blynk.virtualWrite(
+    V8,
+    brightnessPercent
+  );
+
+  Blynk.virtualWrite(
+    V9,
+    vibrationState
+  );
+
+  // --------------------------------------------------------
+  // SAFETY
+  // --------------------------------------------------------
+  Blynk.virtualWrite(
+    V10,
+    safetyLatency
+  );
+
+  Blynk.virtualWrite(
+    V11,
+    energySaving
+  );
+
+  // --------------------------------------------------------
+  // SYSTEM STATUS
+  // --------------------------------------------------------
+  Blynk.virtualWrite(
+    V24,
+    "ONLINE"
+  );
+
+  Blynk.virtualWrite(
+    V25,
+    energyNodeOnline ? "ONLINE" : "OFFLINE"
+  );
+
+  Blynk.virtualWrite(
+    V26,
+    lightingNodeOnline ? "ONLINE" : "OFFLINE"
+  );
+
+  Blynk.virtualWrite(
+    V27,
+    manualMode ? "MANUAL" : "AUTO"
+  );
+
+  // Keep dashboard synchronized
+  Blynk.virtualWrite(
+    V28,
+    manualBrightness
+  );
+
+  Blynk.virtualWrite(
+    V29,
+    manualMode ? 1 : 0
+  );
+
+  Serial.println("Blynk data updated.");
+}
+
+// ==========================================================
+// CHECK NODE STATUS
+// ==========================================================
+void checkNodeStatus()
+{
+  unsigned long now = millis();
+
+  // --------------------------------------------------------
+  // Energy node timeout = 5 sec
+  // --------------------------------------------------------
+  if (
+    energyNodeOnline &&
+    now - lastEnergyPacket > 5000
+  )
+  {
+    energyNodeOnline = false;
+
+    Serial.println(
+      "WARNING: ENERGY NODE OFFLINE"
+    );
+
+    beep(300);
+  }
+
+  // --------------------------------------------------------
+  // Lighting node timeout = 5 sec
+  // --------------------------------------------------------
+  if (
+    lightingNodeOnline &&
+    now - lastLightingPacket > 5000
+  )
+  {
+    lightingNodeOnline = false;
+
+    Serial.println(
+      "WARNING: LIGHTING NODE OFFLINE"
+    );
+
+    beep(300);
+  }
+}
+
+// ==========================================================
+// WIFI CHECK
+// ==========================================================
+void checkWiFi()
+{
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.println(
+      "Wi-Fi disconnected. Reconnecting..."
+    );
+
+    WiFi.disconnect();
+
+    WiFi.begin(
+      ssid,
+      pass
+    );
+  }
+}
+
+// ==========================================================
+// BLYNK CONNECTED
+// ==========================================================
+BLYNK_CONNECTED()
+{
+  Serial.println(
+    "Blynk Cloud connected."
+  );
+
+  // Get latest dashboard control values
+  Blynk.syncVirtual(V28);
+  Blynk.syncVirtual(V29);
+
+  // Update status
+  Blynk.virtualWrite(
+    V24,
+    "ONLINE"
+  );
+}
+
+// ==========================================================
+// SETUP
+// ==========================================================
+void setup()
+{
+  Serial.begin(115200);
+
+  delay(500);
+
+  Serial.println();
+  Serial.println(
+    "========================================"
+  );
+  Serial.println(
+    " MAIN ESP32 CONTROL NODE"
+  );
+  Serial.println(
+    " SMART ADAPTIVE STREET LIGHTING"
+  );
+  Serial.println(
+    "========================================"
+  );
+
+  // --------------------------------------------------------
+  // Buzzer
+  // --------------------------------------------------------
+  pinMode(
+    BUZZER_PIN,
+    OUTPUT
+  );
+
+  digitalWrite(
+    BUZZER_PIN,
+    LOW
+  );
+
+  // --------------------------------------------------------
+  // Buttons
+  // --------------------------------------------------------
+  for (int i = 0; i < 4; i++)
+  {
+    pinMode(
+      buttonPins[i],
+      INPUT_PULLUP
+    );
+  }
+
+  // --------------------------------------------------------
+  // SPI
+  // --------------------------------------------------------
+  SPI.begin(
+    TFT_SCLK,
+    -1,
+    TFT_MOSI,
+    TFT_CS
+  );
+
+  // --------------------------------------------------------
+  // TFT
+  // --------------------------------------------------------
+  tft.initR(
+    INITR_BLACKTAB
+  );
+
+  tft.setRotation(1);
+
+  tft.fillScreen(
+    ST77XX_BLACK
+  );
+
+  tft.setTextColor(
+    ST77XX_CYAN
+  );
+
+  tft.setTextSize(1);
+
+  tft.setCursor(8, 35);
+  tft.println(
+    "SMART ADAPTIVE"
+  );
+
+  tft.setCursor(8, 50);
+  tft.println(
+    "STREET LIGHTING"
+  );
+
+  tft.setTextColor(
+    ST77XX_WHITE
+  );
+
+  tft.setCursor(8, 70);
+  tft.println(
+    "Initializing..."
+  );
+
+  delay(500);
+
+  // --------------------------------------------------------
+  // Wi-Fi + Blynk
+  // --------------------------------------------------------
+  Serial.println(
+    "Connecting Wi-Fi + Blynk..."
+  );
+
+  Blynk.begin(
+    BLYNK_AUTH_TOKEN,
+    ssid,
+    pass
+  );
+
+  Serial.println(
+    "Blynk initialization complete."
+  );
+
+  // --------------------------------------------------------
+  // UDP
+  // --------------------------------------------------------
+  udp.begin(
+    UDP_PORT
+  );
+
+  Serial.print(
+    "UDP listening on port: "
+  );
+
+  Serial.println(
+    UDP_PORT
+  );
+
+  Serial.print(
+    "Main ESP32 IP: "
+  );
+
+  Serial.println(
+    WiFi.localIP()
+  );
+
+  // --------------------------------------------------------
+  // Timers
+  // --------------------------------------------------------
+  // Blynk recommends timer-based sending instead of
+  // continuous virtualWrite() inside loop().
+  timer.setInterval(
+    2000L,
+    sendBlynkData
+  );
+
+  timer.setInterval(
+    1000L,
+    checkNodeStatus
+  );
+
+  timer.setInterval(
+    10000L,
+    checkWiFi
+  );
+
+  // --------------------------------------------------------
+  // Initial screen
+  // --------------------------------------------------------
+  currentPage = 0;
+
+  updateTFT();
+
+  beep(100);
+
+  Serial.println(
+    "MAIN CONTROL NODE READY."
+  );
+}
+
+// ==========================================================
+// LOOP
+// ==========================================================
+void loop()
+{
+  // Blynk service
+  Blynk.run();
+
+  // Blynk timers
+  timer.run();
+
+  // Receive Mini ESP32 data
+  receiveUDP();
+
+  // Buttons
+  handleButtons();
+
+  // Buzzer
+  serviceBuzzer();
+
+  // Keep display reasonably current
+  static unsigned long lastDisplay = 0;
+
+  if (millis() - lastDisplay >= 1000)
+  {
+    lastDisplay = millis();
+
+    updateTFT();
+  }
+}
